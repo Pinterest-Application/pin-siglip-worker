@@ -21,6 +21,7 @@ INPUT_TOPIC = os.getenv("KAFKA_INPUT_TOPIC", "pin-image-process-topic")
 OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "pin-image-embedding-topic")
 CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "pin-vectorizer-group")
 MODEL_NAME = os.getenv("MODEL_NAME", "google/siglip-so400m-patch14-384")
+AUTO_OFFSET_RESET = os.getenv("KAFKA_AUTO_OFFSET_RESET", "latest")
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
 NUM_DOWNLOAD_THREADS = int(os.getenv("NUM_DOWNLOAD_THREADS", "8"))
@@ -39,7 +40,7 @@ consumer = KafkaConsumer(
     INPUT_TOPIC,
     bootstrap_servers=BOOTSTRAP_SERVERS,
     group_id=CONSUMER_GROUP,
-    auto_offset_reset="latest",
+    auto_offset_reset=AUTO_OFFSET_RESET,
     enable_auto_commit=False,
     max_poll_records=BATCH_SIZE,
     value_deserializer=lambda m: json.loads(m.decode("utf-8")),
@@ -75,6 +76,8 @@ while True:
     if not batch_items:
         continue
 
+    logger.info(f"Kafka-dan {len(batch_items)} ədəd mesaj qəbul edildi. Şəkillər SeaweedFS-dən oxunur...")
+
     with ThreadPoolExecutor(max_workers=NUM_DOWNLOAD_THREADS) as executor:
         download_results = list(executor.map(fetch_image, batch_items))
 
@@ -95,6 +98,9 @@ while True:
 
     with torch.no_grad():
         features = model.get_image_features(**inputs)
+        if hasattr(features, "pooler_output") and features.pooler_output is not None:
+            features = features.pooler_output
+
         features = features / features.norm(p=2, dim=-1, keepdim=True)
         embeddings = features.to(torch.float32).cpu().tolist()
 
@@ -111,4 +117,4 @@ while True:
 
     producer.flush()
     consumer.commit()
-    logger.info(f"{len(valid_results)} ədəd şəkil batch şəklində emal edildi.")
+    logger.info(f"{len(valid_results)} ədəd vektor {OUTPUT_TOPIC} topic-inə göndərildi.")
