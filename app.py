@@ -12,10 +12,10 @@ from transformers import AutoModel, AutoProcessor
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# Konfiqurasiyanın Environment Variables-dan oxunması
+# Load configurations from environment variables
 BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
 if not BOOTSTRAP_SERVERS:
-    raise ValueError("KAFKA_BOOTSTRAP_SERVERS environment dəyişəni təyin edilməyib!")
+    raise ValueError("KAFKA_BOOTSTRAP_SERVERS environment variable is not set!")
 
 INPUT_TOPIC = os.getenv("KAFKA_INPUT_TOPIC", "pin-image-process-topic")
 OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "pin-image-embedding-topic")
@@ -30,7 +30,7 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.float16 if device == "cuda" else torch.float32
 
-logger.info(f"Model yüklənir: {MODEL_NAME} (Device: {device}, Dtype: {dtype})")
+logger.info(f"Loading model: {MODEL_NAME} (Device: {device}, Dtype: {dtype})")
 
 processor = AutoProcessor.from_pretrained(MODEL_NAME)
 model = AutoModel.from_pretrained(MODEL_NAME, torch_dtype=dtype).to(device)
@@ -55,8 +55,10 @@ producer = KafkaProducer(
 
 
 def fetch_image(item):
+    pin_id = item.get("pinId")
     url = item.get("mediaUrl")
     try:
+        logger.info(f"Fetching image from SeaweedFS for pinId: {pin_id}")
         res = requests.get(url, timeout=REQUEST_TIMEOUT)
         res.raise_for_status()
         img = Image.open(io.BytesIO(res.content)).convert("RGB")
@@ -65,7 +67,7 @@ def fetch_image(item):
         return {"item": item, "image": None, "error": str(e)}
 
 
-logger.info(f"Worker başladıldı. Dinlənilir: {INPUT_TOPIC}")
+logger.info(f"Worker successfully started. Listening on topic: {INPUT_TOPIC}")
 
 while True:
     records_dict = consumer.poll(timeout_ms=1000, max_records=BATCH_SIZE)
@@ -76,7 +78,8 @@ while True:
     if not batch_items:
         continue
 
-    logger.info(f"Kafka-dan {len(batch_items)} ədəd mesaj qəbul edildi. Şəkillər SeaweedFS-dən oxunur...")
+    batch_pin_ids = [item.get("pinId") for item in batch_items]
+    logger.info(f"Received batch of {len(batch_items)} record(s). Target pinIds: {batch_pin_ids}")
 
     with ThreadPoolExecutor(max_workers=NUM_DOWNLOAD_THREADS) as executor:
         download_results = list(executor.map(fetch_image, batch_items))
@@ -85,11 +88,15 @@ while True:
 
     for r in download_results:
         if r["error"]:
-            logger.error(f"Şəkil yüklənmədi (pinId: {r['item'].get('pinId')}): {r['error']}")
+            logger.error(f"Image download failed for pinId: {r['item'].get('pinId')} | Reason: {r['error']}")
 
     if not valid_results:
+        logger.warning(f"No downloadable images in batch. Skipping pinIds: {batch_pin_ids}")
         consumer.commit()
         continue
+
+    active_pin_ids = [r["item"].get("pinId") for r in valid_results]
+    logger.info(f"Computing embeddings for {len(active_pin_ids)} image(s). Active pinIds: {active_pin_ids}")
 
     images = [r["image"] for r in valid_results]
     inputs = processor(images=images, return_tensors="pt").to(device)
@@ -106,15 +113,17 @@ while True:
 
     for r, embedding in zip(valid_results, embeddings):
         item = r["item"]
+        pin_id = item.get("pinId")
         payload = {
-            "pinId": item.get("pinId"),
+            "pinId": pin_id,
             "mediaUrl": item.get("mediaUrl"),
             "mediaWidth": item.get("mediaWidth"),
             "mediaHeight": item.get("mediaHeight"),
             "embedding": embedding,
         }
-        producer.send(OUTPUT_TOPIC, key=str(item.get("pinId")).encode("utf-8"), value=payload)
+        producer.send(OUTPUT_TOPIC, key=str(pin_id).encode("utf-8"), value=payload)
+        logger.info(f"Published 1152-d embedding to topic '{OUTPUT_TOPIC}' for pinId: {pin_id}")
 
     producer.flush()
     consumer.commit()
-    logger.info(f"{len(valid_results)} ədəd vektor {OUTPUT_TOPIC} topic-inə göndərildi.")
+    logger.info(f"Successfully processed batch and committed offset for pinIds: {active_pin_ids}")
