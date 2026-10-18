@@ -2,4 +2,6 @@ kafka-python-ng
 requests
 pillow
 transformers
+sentencepiece
+protobuf
 torch --extra-index-url https://download.pytorch.org/whl/cpu
